@@ -7,16 +7,210 @@
 #include <functional>
 #include <iostream>
 #include <map>
+// #include <nfd.h>
+// #include <regex>
+#include <string>
 #include <vector>
 
 static void glfw_error_callback(int error, const char *description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+// настройки скалирования интерфейса
 float get_dpi_scale(GLFWwindow *window) {
     float xscale, yscale;
     glfwGetWindowContentScale(window, &xscale, &yscale);
     return (xscale + yscale) / 2.0f; // Средний масштаб
+}
+
+// реализация диалога выбора файла
+namespace fs = std::filesystem;
+
+const char *filterPresets[] = {"Все файлы (*.*)", "Текстовые файлы (*.txt)",
+                               "Изображения (*.png;*.jpg;*.jpeg;*.bmp)",
+                               "Документы (*.pdf;*.doc;*.docx)",
+                               "Базы данных (*.db)"};
+
+const char *filterPatterns[] = {"*", "*.txt", "*.png;*.jpg;*.jpeg;*.bmp",
+                                "*.pdf;*.doc;*.docx", "*.db"};
+
+class FileBrowser {
+    public:
+        std::string currentPath = fs::current_path().string();
+        std::string selectedFile;
+        std::vector<std::string> directories;
+        std::vector<std::string> files;
+        std::string filter = "*.db";    // Маска по умолчанию - все файлы
+        char filterInput[128] = "*.db"; // Буфер для ввода маски
+
+        void Refresh() {
+            directories.clear();
+            files.clear();
+
+            for (const auto &entry : fs::directory_iterator(currentPath)) {
+                try {
+                    if (entry.is_directory()) {
+                        directories.push_back(entry.path().filename().string());
+                    } else if (MatchesFilter(
+                                   entry.path().filename().string())) {
+                        files.push_back(entry.path().filename().string());
+                    }
+                } catch (...) {
+                    // Пропустить файлы с проблемами доступа
+                }
+            }
+        }
+        bool MatchesFilter(const std::string &filename) {
+            std::vector<std::string> masks;
+            std::istringstream iss(filter);
+            std::string mask;
+
+            while (std::getline(iss, mask, ';')) {
+                if (mask == "*")
+                    return true;
+
+                if (mask.find("*.") == 0) {
+                    std::string ext = mask.substr(1);
+                    if (filename.size() >= ext.size() &&
+                        filename.compare(filename.size() - ext.size(),
+                                         ext.size(), ext) == 0) {
+                        return true;
+                    }
+                } else if (filename.find(mask) != std::string::npos) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool Draw() {
+            bool fileSelected = false;
+
+            // Панель управления с фильтром
+            if (ImGui::Button("Наверх") && currentPath != "/") {
+                currentPath = fs::path(currentPath).parent_path().string();
+                Refresh();
+            }
+
+            ImGui::SameLine();
+            ImGui::Text("Текущая папка: %s", currentPath.c_str());
+
+            if (ImGui::BeginCombo("Предустановки", filter.c_str())) {
+                for (int i = 0; i < IM_ARRAYSIZE(filterPresets); i++) {
+                    if (ImGui::Selectable(filterPresets[i],
+                                          filter == filterPatterns[i])) {
+                        filter = filterPatterns[i];
+                        strcpy(filterInput, filter.c_str());
+                        Refresh();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::BeginChild("##browser", ImVec2(0, 300), true);
+
+            // Показываем папки
+            for (const auto &dir : directories) {
+                if (ImGui::Selectable(("[D] " + dir).c_str(), false,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        currentPath = (fs::path(currentPath) / dir).string();
+                        Refresh();
+                    }
+                }
+            }
+
+            // Показываем файлы
+            for (const auto &file : files) {
+                if (ImGui::Selectable(file.c_str(), selectedFile == file)) {
+                    selectedFile = file;
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        fileSelected = true;
+                    }
+                }
+            }
+
+            ImGui::EndChild();
+
+            return fileSelected;
+        }
+};
+
+// Глобальные переменные для управления окном
+bool showFileBrowser = false;
+FileBrowser browser; // Наш класс файлового браузера
+
+// Наша база данных
+Database db;
+std::string dbPath;
+bool dbOpen = false;
+
+// Состояние интерфейса
+std::vector<std::string> tables;
+std::string currentTable;
+std::vector<std::map<std::string, std::string>> records;
+std::vector<ColumnInfo> tableInfo;
+int selectedRecord = -1;
+std::map<std::string, std::string> editValues;
+bool inTransaction = false;
+
+// выбор файла
+void RenderFileBrowser() {
+    if (showFileBrowser) {
+        // Настройки окна файлового браузера
+        ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Выбор файла", &showFileBrowser)) {
+            if (browser.Draw()) // Если файл выбран
+            {
+                std::string selectedFile =
+                    (fs::path(browser.currentPath) / browser.selectedFile);
+                printf("Выбран файл: %s\n", selectedFile.c_str());
+                // Здесь можно обработать выбранный файл
+
+                showFileBrowser = false; // Закрываем окно после выбора
+            }
+
+            // Кнопка "Открыть" для подтверждения выбора
+            if (ImGui::Button("Открыть") && !browser.selectedFile.empty()) {
+                std::string selectedFile =
+                    (fs::path(browser.currentPath) / browser.selectedFile);
+                printf("Выбран файл: %s\n", selectedFile.c_str());
+
+                std::string newPath =
+                    (fs::path(browser.currentPath) / browser.selectedFile);
+                // открываем базу
+                if (!newPath.empty()) {
+                    dbPath = newPath;
+                    dbOpen = db.open(dbPath);
+                    if (dbOpen) {
+                        tables = db.getTables();
+                        if (!tables.empty()) {
+                            currentTable = tables[0];
+                            tableInfo = db.getTableInfo(currentTable);
+                            records =
+                                db.query("SELECT * FROM " + currentTable + ";");
+                        } else {
+                            currentTable.clear();
+                            tableInfo.clear();
+                            records.clear();
+                        }
+                        selectedRecord = -1;
+                        editValues.clear();
+                    }
+                }
+
+                showFileBrowser = false;
+            }
+
+            ImGui::SameLine();
+
+            // Кнопка отмены
+            if (ImGui::Button("Отмена")) {
+                showFileBrowser = false;
+            }
+        }
+        ImGui::End();
+    }
 }
 
 int main(int argc, char **argv) {
@@ -65,20 +259,6 @@ int main(int argc, char **argv) {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    // Наша база данных
-    Database db;
-    std::string dbPath;
-    bool dbOpen = false;
-
-    // Состояние интерфейса
-    std::vector<std::string> tables;
-    std::string currentTable;
-    std::vector<std::map<std::string, std::string>> records;
-    std::vector<ColumnInfo> tableInfo;
-    int selectedRecord = -1;
-    std::map<std::string, std::string> editValues;
-    bool inTransaction = false;
-
     // Главный цикл
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -98,24 +278,18 @@ int main(int argc, char **argv) {
                          ImGuiWindowFlags_MenuBar);
 
         // ImGui::Begin("Database Editor", nullptr,);
-
         // Меню
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open Database...")) {
-                    // В реальном приложении здесь должен быть диалог выбора
-                    // файла
-                    dbPath = "test.db"; // Пример пути
-                    dbOpen = db.open(dbPath);
-                    if (dbOpen) {
-                        tables = db.getTables();
-                        if (!tables.empty()) {
-                            currentTable = tables[0];
-                            tableInfo = db.getTableInfo(currentTable);
-                            records =
-                                db.query("SELECT * FROM " + currentTable + ";");
-                        }
-                    }
+                    // std::string newPath = OpenFileDialog();
+                    showFileBrowser = true;
+                    browser.Refresh(); // Обновляем список файлов при открытии
+                                       // if (file.Draw()) {
+                    //                        std::string newPath =
+                    //                            (fs::path(file.currentPath) /
+                    //                            file.selectedFile)
+                    //                                .string();
                 }
 
                 if (ImGui::MenuItem("Close Database", nullptr, false, dbOpen)) {
@@ -164,6 +338,11 @@ int main(int argc, char **argv) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1, 0, 0, 1), " (Transaction active)");
         }
+
+        // диалог выбора файла
+        //        if (!dbOpen) {
+        RenderFileBrowser();
+        //        }
 
         // Выбор таблицы
         if (dbOpen && !tables.empty()) {
@@ -257,8 +436,8 @@ int main(int argc, char **argv) {
                     }
 
                     if (where.empty()) {
-                        // Если нет первичного ключа, используем все поля для
-                        // идентификации записи
+                        // Если нет первичного ключа, используем все поля
+                        // для идентификации записи
                         for (const auto &col : tableInfo) {
                             if (!where.empty())
                                 where += " AND ";
@@ -316,8 +495,8 @@ int main(int argc, char **argv) {
                         }
 
                         if (where.empty()) {
-                            // Если нет первичного ключа, используем все поля
-                            // для идентификации записи
+                            // Если нет первичного ключа, используем все
+                            // поля для идентификации записи
                             for (const auto &col : tableInfo) {
                                 if (!where.empty())
                                     where += " AND ";
